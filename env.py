@@ -14,12 +14,13 @@ class AmadeusTradingEnv(gym.Env):
         super(AmadeusTradingEnv, self).__init__()
         self.render_mode = render_mode
 
-        # 13 Discrete Actions:
+        # 14 Discrete Actions:
         # 0: Hold
         # 1: Buy 10 AMDS, 2: Sell 10 AMDS, 3: Buy AMDS Call, 4: Buy AMDS Put
         # 5: Buy 10 SERN, 6: Sell 10 SERN, 7: Buy SERN Call, 8: Buy SERN Put
         # 9: Buy 10 D-ML, 10: Sell 10 D-ML, 11: Buy D-ML Call, 12: Buy D-ML Put
-        self.action_space = spaces.Discrete(13)
+        # 13: Close All Active Options (Take Profit / Cut Loss)
+        self.action_space = spaces.Discrete(14)
 
         # Observation Space: 64 flattened continuous/discrete features
         # [0] Cash
@@ -31,12 +32,15 @@ class AmadeusTradingEnv(gym.Env):
         high = np.array([np.inf] * 64, dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        self.tx_fee = 0.50
+        self.tx_fee_pct = 0.001  # 0.1% of trade value (proportional, not flat)
+        self.dividend_paid = 0.0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         self.ticks = 0
+        self.days = 0
+        self.dividend_paid = 0.0
         self.days = 1
         self.cash = 1000.00
         self.net_worth = 1000.00
@@ -64,8 +68,8 @@ class AmadeusTradingEnv(gym.Env):
         # 3. Dense Reward: Profit/Loss generated in this specific step
         reward = self.net_worth - prev_net_worth
 
-        # 4. End condition: Bankruptcy or 25% Drawdown (Strict Risk Management)
-        terminated = bool(self.net_worth <= 750.0)
+        # 4. End condition: True bankruptcy only — let agent experience full episodes
+        terminated = bool(self.net_worth <= 0.0)
 
         # 5. Truncation: 1 year of trading (252 days * 12 market updates a day)
         truncated = bool(self.ticks >= 3024)
@@ -107,6 +111,25 @@ class AmadeusTradingEnv(gym.Env):
         if action == 0:
             return # Hold position
 
+        if action == 13: # Close All Active Options simultaneously (Take Profit / Cut Loss)
+            for opt in self.active_options:
+                st = self.stocks[opt["stock_idx"]]
+                time_to_expiry_years = max(0.0, opt["days_left"] / 252.0)
+                annualized_vol = st["vol"] / 12
+                price_per_share = self._binomial_option_pricing(
+                    S=st["price"],
+                    K=opt["strike"],
+                    T=time_to_expiry_years,
+                    r=0.05,
+                    sigma=annualized_vol,
+                    opt_type=opt["type"]
+                )
+                val = price_per_share * 100 * opt["qty"]
+                fee = val * self.tx_fee_pct
+                self.cash += max(0.0, val - fee)
+            self.active_options = []
+            return
+
         stock_idx = (action - 1) // 4
         action_type = (action - 1) % 4
 
@@ -114,7 +137,9 @@ class AmadeusTradingEnv(gym.Env):
         share_multiplier = 10
 
         if action_type == 0: # Buy Shares
-            cost = (st["price"] * share_multiplier) + self.tx_fee
+            trade_value = st["price"] * share_multiplier
+            fee = trade_value * self.tx_fee_pct
+            cost = trade_value + fee
             if self.cash >= cost:
                 self.cash -= cost
 
@@ -133,7 +158,8 @@ class AmadeusTradingEnv(gym.Env):
         elif action_type == 1: # Sell (or Short) Shares
             # Case A: Selling shares we already own
             if st["owned"] >= share_multiplier:
-                revenue = (st["price"] * share_multiplier) - self.tx_fee
+                trade_value = st["price"] * share_multiplier
+                revenue = trade_value - (trade_value * self.tx_fee_pct)
                 self.cash += revenue
                 st["owned"] -= share_multiplier
                 if st["owned"] == 0:
@@ -147,7 +173,7 @@ class AmadeusTradingEnv(gym.Env):
 
                 # Strict 150% Initial Margin Requirement
                 if self.net_worth > 1.5 * (total_short_liability + new_short_value):
-                    revenue = new_short_value - self.tx_fee
+                    revenue = new_short_value - (new_short_value * self.tx_fee_pct)
                     self.cash += revenue
 
                     # Update cost basis for short
@@ -217,7 +243,7 @@ class AmadeusTradingEnv(gym.Env):
 
         # Derive annualized volatility based on environment's random normal step generation
         # (Std Dev of random walk * sqrt(total ticks in a year)) -> approx vol * 0.448
-        annualized_vol = st["vol"] * 0.448
+        annualized_vol = st["vol"] / 12
         risk_free_rate = 0.05
 
         price_per_share = self._binomial_option_pricing(
@@ -229,7 +255,8 @@ class AmadeusTradingEnv(gym.Env):
             opt_type=opt_type
         )
 
-        premium = (price_per_share * 100 * qty) + self.tx_fee
+        option_value = price_per_share * 100 * qty
+        premium = option_value + (option_value * self.tx_fee_pct)
 
         if self.cash >= premium:
             self.cash -= premium
@@ -266,7 +293,7 @@ class AmadeusTradingEnv(gym.Env):
 
             # Use binomial model to assess the ongoing market time-value of options in portfolio
             time_to_expiry_years = max(0.0, opt["days_left"] / 252.0)
-            annualized_vol = st["vol"] * 0.448
+            annualized_vol = st["vol"] / 12
             risk_free_rate = 0.05
 
             price_per_share = self._binomial_option_pricing(
@@ -288,26 +315,28 @@ class AmadeusTradingEnv(gym.Env):
         for st in self.stocks:
             if st["owned"] > 0: # Long Position
                 if st["price"] <= st["cost_basis"] * (1.0 - sl_pct) or st["price"] >= st["cost_basis"] * (1.0 + tp_pct):
-                    revenue = (st["price"] * st["owned"]) - self.tx_fee
+                    exit_value = st["price"] * st["owned"]
+                    revenue = exit_value - (exit_value * self.tx_fee_pct)
                     self.cash += revenue
                     st["owned"] = 0
                     st["cost_basis"] = 0.0
 
             elif st["owned"] < 0: # Short Position
                 if st["price"] >= st["cost_basis"] * (1.0 + sl_pct) or st["price"] <= st["cost_basis"] * (1.0 - tp_pct):
-                    cost = (st["price"] * abs(st["owned"])) + self.tx_fee
+                    exit_value = st["price"] * abs(st["owned"])
+                    cost = exit_value + (exit_value * self.tx_fee_pct)
                     self.cash -= cost
                     st["owned"] = 0
                     st["cost_basis"] = 0.0
 
+        # Margin Call Liquidation: If cash is negative, forcefully sell long stocks to cover the deficit
         if self.cash < 0:
             for st in self.stocks:
                 if st["owned"] > 0:
+                    # Sell in blocks of 10 shares as long as we have shares and cash is negative
                     while st["owned"] >= 10 and self.cash < 0:
                         trade_value = st["price"] * 10
-                        fee = getattr(self, "tx_fee", 0.0)
-                        if hasattr(self, "tx_fee_pct"):
-                            fee = trade_value * self.tx_fee_pct
+                        fee = trade_value * self.tx_fee_pct
                         revenue = trade_value - fee
                         self.cash += revenue
                         st["owned"] -= 10
@@ -326,7 +355,7 @@ class AmadeusTradingEnv(gym.Env):
         else:
             trend = (r1 - 0.5) * 0.2 # STABLE
 
-        return price * (normal + trend) * (volatility) * 0.01
+        return price * (normal + trend) * (volatility/12) * 0.01
 
     def _change_economy(self):
         r = self.np_random.random()
@@ -367,16 +396,56 @@ class AmadeusTradingEnv(gym.Env):
         if self.np_random.random() < 0.05:
             s_idx = self.np_random.integers(0, 3)
             st = self.stocks[s_idx]
-            yield_val = 0.02 + (self.np_random.random() * 0.04)
-            payout = st["owned"] * (st["price"] * yield_val)
-            self.cash += payout
+            # Process dividends (1% chance to pay 2-5% dividend)
+            if self.np_random.random() < 0.01:
+                yield_val = self.np_random.uniform(0.02, 0.05)
+                payout = st["owned"] * (st["price"] * yield_val)
+                self.cash += payout
+                if payout < 0:
+                    self.dividend_paid += abs(payout)
+
+    def render(self):
+        econ_names = ["STABLE", "BOOM", "BUST"]
+        econ_str = econ_names[self.economy] if self.economy < len(econ_names) else "UNKNOWN"
+        hour = (self.ticks % 12) + 1
+        pnl = self.net_worth - 1000.00
+        pnl_sign = "+" if pnl >= 0 else ""
+
+        print("\n" + "=" * 65)
+        print(f" [AMADEUS TERMINAL] Day: {self.days:03d} | Tick: {hour:02d}/12 | Economy: {econ_str:<6} ")
+        print(f" Cash: ${self.cash:>9.2f} | Net Worth: ${self.net_worth:>9.2f} ({pnl_sign}${pnl:.2f})")
+        print("-" * 65)
+        print(f" {'ASSET':<6} | {'PRICE':>8} | {'OWNED':>6} | {'BASIS':>8} | {'UNREAL P/L':>11}")
+        print("-" * 65)
+        for s in self.stocks:
+            owned = s["owned"]
+            price = s["price"]
+            basis = s["cost_basis"]
+            if owned > 0:
+                unreal = (price - basis) * owned
+            elif owned < 0:
+                unreal = (basis - price) * abs(owned)
+            else:
+                unreal = 0.0
+            u_sign = "+" if unreal >= 0 else ""
+            u_str = f"{u_sign}${unreal:.2f}" if owned != 0 else "-"
+            b_str = f"${basis:.2f}" if owned != 0 else "-"
+            print(f" {s['name']:<6} | ${price:>7.2f} | {owned:>6} | {b_str:>8} | {u_str:>11}")
+
+        if self.active_options:
+            print("-" * 65)
+            print(" ACTIVE OPTIONS:")
+            for i, opt in enumerate(self.active_options):
+                st_name = self.stocks[opt["stock_idx"]]["name"]
+                print(f"  [{i+1}] {st_name} {opt['type']} | Strike: ${opt['strike']:.2f} | Expires in: {opt['days_left']} days")
+        print("=" * 65)
 
 
 if __name__ == "__main__":
     env = AmadeusTradingEnv()
 
     # Simulating a random agent taking random trades
-    episodes = 500
+    episodes = 1000
     total_rewards = []
 
     for ep in tqdm(range(episodes), desc="Simulating Random Agent Actions"):
