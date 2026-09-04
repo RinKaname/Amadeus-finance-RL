@@ -300,6 +300,20 @@ class AmadeusTradingEnv(gym.Env):
                     st["owned"] = 0
                     st["cost_basis"] = 0.0
 
+        if self.cash < 0:
+            for st in self.stocks:
+                if st["owned"] > 0:
+                    while st["owned"] >= 10 and self.cash < 0:
+                        trade_value = st["price"] * 10
+                        fee = getattr(self, "tx_fee", 0.0)
+                        if hasattr(self, "tx_fee_pct"):
+                            fee = trade_value * self.tx_fee_pct
+                        revenue = trade_value - fee
+                        self.cash += revenue
+                        st["owned"] -= 10
+                        if st["owned"] == 0:
+                            st["cost_basis"] = 0.0
+
     def _get_price_change(self, volatility, price):
         r1 = self.np_random.random()
         r2 = self.np_random.random()
