@@ -39,15 +39,20 @@ def run_heuristic_bot():
             env.step(3)
             env.step(4)
 
-            # Step forward to trigger market updates
-            obs, reward, terminated, truncated, info = env.step(0)
-            done = terminated or truncated
+            # Step forward 10 times to trigger market updates
+            for _ in range(10):
+                obs, reward, terminated, truncated, info = env.step(0)
+                if terminated or truncated:
+                    done = True
+                    break
 
             # Check if we successfully exploited the bug
             if env.cash < 0:
                 print("\n--- BUG DETECTED ---")
                 print("The agent's cash balance has gone NEGATIVE, but the episode did not terminate!")
                 print(f"Current Cash: {env.cash:.2f}")
+                print(f"Dividend paid (short): {getattr(env, 'dividend_paid', 0.0):.2f}")
+                print(f"Episode Properly Terminated (Margin Call): {terminated}")
                 print(f"Current Net Worth: {env.net_worth:.2f}")
                 print("Reason: RRR bracket order (stop loss/take profit) closed a short position and deducted the cover cost without checking available cash.")
                 print("--------------------\n")
