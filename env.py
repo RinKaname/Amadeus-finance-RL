@@ -308,27 +308,6 @@ class AmadeusTradingEnv(gym.Env):
             val = price_per_share * 100 * opt["qty"]
             self.net_worth += val
 
-        # RRR Bracket Orders (10% Stop Loss, 20% Take Profit)
-        sl_pct = 0.10
-        tp_pct = 0.20
-
-        for st in self.stocks:
-            if st["owned"] > 0: # Long Position
-                if st["price"] <= st["cost_basis"] * (1.0 - sl_pct) or st["price"] >= st["cost_basis"] * (1.0 + tp_pct):
-                    exit_value = st["price"] * st["owned"]
-                    revenue = exit_value - (exit_value * self.tx_fee_pct)
-                    self.cash += revenue
-                    st["owned"] = 0
-                    st["cost_basis"] = 0.0
-
-            elif st["owned"] < 0: # Short Position
-                if st["price"] >= st["cost_basis"] * (1.0 + sl_pct) or st["price"] <= st["cost_basis"] * (1.0 - tp_pct):
-                    exit_value = st["price"] * abs(st["owned"])
-                    cost = exit_value + (exit_value * self.tx_fee_pct)
-                    self.cash -= cost
-                    st["owned"] = 0
-                    st["cost_basis"] = 0.0
-
         # Margin Call Liquidation: If cash is negative, forcefully sell long stocks to cover the deficit
         if self.cash < 0:
             for st in self.stocks:
