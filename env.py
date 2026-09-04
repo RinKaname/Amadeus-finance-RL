@@ -10,6 +10,16 @@ class AmadeusTradingEnv(gym.Env):
     """
     metadata = {'render_modes': ['human']}
 
+    # --- Environment Constants ---
+    TICKS_PER_DAY = 12
+    TRADING_DAYS_PER_YEAR = 252
+    ACTIONS_PER_ASSET = 4
+    SHARE_MULTIPLIER = 10
+    MAX_ACTIVE_OPTIONS = 4
+    RISK_FREE_RATE = 0.05
+    OPTION_DURATION_DAYS = 7
+    OBSERVATION_SIZE = 64  # Padded to 64 for optimal GPU tensor alignment
+
     def __init__(self, render_mode=None):
         super(AmadeusTradingEnv, self).__init__()
         self.render_mode = render_mode
@@ -26,10 +36,11 @@ class AmadeusTradingEnv(gym.Env):
         # [0] Cash
         # [1] Economy (0=STABLE, 1=BOOM, 2=BUST)
         # [2-7] Stocks: (Price, Owned) for AMDS, SERN, D-ML
-        # [8-63] Options: 4 active slots * 5 features per slot
+        # [8-27] Options: 4 active slots * 5 features per slot
         #        Slot features: (is_active, type_call_0_put_1, stock_idx, strike, days_left)
-        low = np.array([-np.inf] * 64, dtype=np.float32)
-        high = np.array([np.inf] * 64, dtype=np.float32)
+        # [28-63] Zero padding for tensor alignment
+        low = np.array([-np.inf] * self.OBSERVATION_SIZE, dtype=np.float32)
+        high = np.array([np.inf] * self.OBSERVATION_SIZE, dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
         self.tx_fee_pct = 0.001  # 0.1% of trade value (proportional, not flat)
@@ -39,9 +50,8 @@ class AmadeusTradingEnv(gym.Env):
         super().reset(seed=seed)
 
         self.ticks = 0
-        self.days = 0
-        self.dividend_paid = 0.0
         self.days = 1
+        self.dividend_paid = 0.0
         self.cash = 1000.00
         self.net_worth = 1000.00
         self.economy = 0 # 0: STABLE, 1: BOOM, 2: BUST
@@ -71,8 +81,8 @@ class AmadeusTradingEnv(gym.Env):
         # 4. End condition: True bankruptcy only — let agent experience full episodes
         terminated = bool(self.net_worth <= 0.0)
 
-        # 5. Truncation: 1 year of trading (252 days * 12 market updates a day)
-        truncated = bool(self.ticks >= 3024)
+        # 5. Truncation: 1 year of trading
+        truncated = bool(self.ticks >= (self.TRADING_DAYS_PER_YEAR * self.TICKS_PER_DAY))
 
         info = {
             "net_worth": self.net_worth,
@@ -82,7 +92,7 @@ class AmadeusTradingEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, info
 
     def _get_obs(self):
-        obs = np.zeros(64, dtype=np.float32)
+        obs = np.zeros(self.OBSERVATION_SIZE, dtype=np.float32)
         obs[0] = self.cash
         obs[1] = float(self.economy)
 
@@ -93,7 +103,7 @@ class AmadeusTradingEnv(gym.Env):
             idx += 2
 
         opt_idx = 8
-        for i in range(4):
+        for i in range(self.MAX_ACTIVE_OPTIONS):
             if i < len(self.active_options):
                 opt = self.active_options[i]
                 obs[opt_idx] = 1.0 # is_active flag
@@ -114,13 +124,13 @@ class AmadeusTradingEnv(gym.Env):
         if action == 13: # Close All Active Options simultaneously (Take Profit / Cut Loss)
             for opt in self.active_options:
                 st = self.stocks[opt["stock_idx"]]
-                time_to_expiry_years = max(0.0, opt["days_left"] / 252.0)
-                annualized_vol = st["vol"] / 12
+                time_to_expiry_years = max(0.0, opt["days_left"] / self.TRADING_DAYS_PER_YEAR)
+                annualized_vol = st["vol"] / self.TICKS_PER_DAY
                 price_per_share = self._binomial_option_pricing(
                     S=st["price"],
                     K=opt["strike"],
                     T=time_to_expiry_years,
-                    r=0.05,
+                    r=self.RISK_FREE_RATE,
                     sigma=annualized_vol,
                     opt_type=opt["type"]
                 )
@@ -130,14 +140,13 @@ class AmadeusTradingEnv(gym.Env):
             self.active_options = []
             return
 
-        stock_idx = (action - 1) // 4
-        action_type = (action - 1) % 4
+        stock_idx = (action - 1) // self.ACTIONS_PER_ASSET
+        action_type = (action - 1) % self.ACTIONS_PER_ASSET
 
         st = self.stocks[stock_idx]
-        share_multiplier = 10
 
         if action_type == 0: # Buy Shares
-            trade_value = st["price"] * share_multiplier
+            trade_value = st["price"] * self.SHARE_MULTIPLIER
             fee = trade_value * self.tx_fee_pct
             cost = trade_value + fee
             if self.cash >= cost:
@@ -145,11 +154,11 @@ class AmadeusTradingEnv(gym.Env):
 
                 # Update Cost Basis
                 if st["owned"] >= 0:
-                    total_spent = (st["owned"] * st["cost_basis"]) + (share_multiplier * st["price"])
-                    st["owned"] += share_multiplier
+                    total_spent = (st["owned"] * st["cost_basis"]) + (self.SHARE_MULTIPLIER * st["price"])
+                    st["owned"] += self.SHARE_MULTIPLIER
                     st["cost_basis"] = total_spent / st["owned"]
                 else: # Covering short, might flip to long
-                    st["owned"] += share_multiplier
+                    st["owned"] += self.SHARE_MULTIPLIER
                     if st["owned"] > 0:
                         st["cost_basis"] = st["price"]
                     elif st["owned"] == 0:
@@ -157,11 +166,11 @@ class AmadeusTradingEnv(gym.Env):
 
         elif action_type == 1: # Sell (or Short) Shares
             # Case A: Selling shares we already own
-            if st["owned"] >= share_multiplier:
-                trade_value = st["price"] * share_multiplier
+            if st["owned"] >= self.SHARE_MULTIPLIER:
+                trade_value = st["price"] * self.SHARE_MULTIPLIER
                 revenue = trade_value - (trade_value * self.tx_fee_pct)
                 self.cash += revenue
-                st["owned"] -= share_multiplier
+                st["owned"] -= self.SHARE_MULTIPLIER
                 if st["owned"] == 0:
                     st["cost_basis"] = 0.0
 
@@ -169,7 +178,7 @@ class AmadeusTradingEnv(gym.Env):
             else:
                 # Calculate current total short liability across all assets
                 total_short_liability = sum([abs(s["owned"]) * s["price"] for s in self.stocks if s["owned"] < 0])
-                new_short_value = st["price"] * share_multiplier
+                new_short_value = st["price"] * self.SHARE_MULTIPLIER
 
                 # Strict 150% Initial Margin Requirement
                 if self.net_worth > 1.5 * (total_short_liability + new_short_value):
@@ -178,11 +187,11 @@ class AmadeusTradingEnv(gym.Env):
 
                     # Update cost basis for short
                     if st["owned"] <= 0:
-                        total_shorted = (abs(st["owned"]) * st["cost_basis"]) + (share_multiplier * st["price"])
-                        st["owned"] -= share_multiplier
+                        total_shorted = (abs(st["owned"]) * st["cost_basis"]) + (self.SHARE_MULTIPLIER * st["price"])
+                        st["owned"] -= self.SHARE_MULTIPLIER
                         st["cost_basis"] = total_shorted / abs(st["owned"])
                     else: # Flipping from long to short
-                        st["owned"] -= share_multiplier
+                        st["owned"] -= self.SHARE_MULTIPLIER
                         st["cost_basis"] = st["price"]
 
         elif action_type == 2: # Buy Call
@@ -216,7 +225,9 @@ class AmadeusTradingEnv(gym.Env):
         p = (np.exp(r * dt) - d) / (u - d)
 
         # Initialize asset prices at maturity
-        prices = S * (u ** np.arange(N, -1, -1)) * (d ** np.arange(0, N + 1, 1))
+        up_steps = np.arange(N, -1, -1)
+        down_steps = np.arange(0, N + 1, 1)
+        prices = S * (u ** up_steps) * (d ** down_steps)
 
         # Initialize option values at maturity
         if opt_type == "CALLS":
@@ -232,25 +243,21 @@ class AmadeusTradingEnv(gym.Env):
         return values[0]
 
     def _buy_option(self, stock_idx, opt_type):
-        if len(self.active_options) >= 4:
+        if len(self.active_options) >= self.MAX_ACTIVE_OPTIONS:
             return
 
         st = self.stocks[stock_idx]
         qty = 1
 
-        # Options are assumed to be generated with 7 days to expiry (7 / 252 years)
-        time_to_expiry_years = 7.0 / 252.0
+        time_to_expiry_years = self.OPTION_DURATION_DAYS / self.TRADING_DAYS_PER_YEAR
 
-        # Derive annualized volatility based on environment's random normal step generation
-        # (Std Dev of random walk * sqrt(total ticks in a year)) -> approx vol * 0.448
-        annualized_vol = st["vol"] / 12
-        risk_free_rate = 0.05
+        annualized_vol = st["vol"] / self.TICKS_PER_DAY
 
         price_per_share = self._binomial_option_pricing(
             S=st["price"],
             K=st["price"],
             T=time_to_expiry_years,
-            r=risk_free_rate,
+            r=self.RISK_FREE_RATE,
             sigma=annualized_vol,
             opt_type=opt_type
         )
@@ -265,7 +272,7 @@ class AmadeusTradingEnv(gym.Env):
                 "stock_idx": stock_idx,
                 "strike": st["price"],
                 "qty": qty,
-                "days_left": 7
+                "days_left": self.OPTION_DURATION_DAYS
             })
 
     def _update_market(self):
@@ -275,8 +282,8 @@ class AmadeusTradingEnv(gym.Env):
         if self.np_random.random() < 0.035:
             self._change_economy()
 
-        # Daily processing (1 day = 12 market updates)
-        if self.ticks % 12 == 0:
+        # Daily processing
+        if self.ticks % self.TICKS_PER_DAY == 0:
             self.days += 1
             self._process_daily_events()
 
@@ -292,15 +299,14 @@ class AmadeusTradingEnv(gym.Env):
             st = self.stocks[opt["stock_idx"]]
 
             # Use binomial model to assess the ongoing market time-value of options in portfolio
-            time_to_expiry_years = max(0.0, opt["days_left"] / 252.0)
-            annualized_vol = st["vol"] / 12
-            risk_free_rate = 0.05
+            time_to_expiry_years = max(0.0, opt["days_left"] / self.TRADING_DAYS_PER_YEAR)
+            annualized_vol = st["vol"] / self.TICKS_PER_DAY
 
             price_per_share = self._binomial_option_pricing(
                 S=st["price"],
                 K=opt["strike"],
                 T=time_to_expiry_years,
-                r=risk_free_rate,
+                r=self.RISK_FREE_RATE,
                 sigma=annualized_vol,
                 opt_type=opt["type"]
             )
@@ -312,13 +318,13 @@ class AmadeusTradingEnv(gym.Env):
         if self.cash < 0:
             for st in self.stocks:
                 if st["owned"] > 0:
-                    # Sell in blocks of 10 shares as long as we have shares and cash is negative
-                    while st["owned"] >= 10 and self.cash < 0:
-                        trade_value = st["price"] * 10
+                    # Sell in blocks of self.SHARE_MULTIPLIER as long as we have shares and cash is negative
+                    while st["owned"] >= self.SHARE_MULTIPLIER and self.cash < 0:
+                        trade_value = st["price"] * self.SHARE_MULTIPLIER
                         fee = trade_value * self.tx_fee_pct
                         revenue = trade_value - fee
                         self.cash += revenue
-                        st["owned"] -= 10
+                        st["owned"] -= self.SHARE_MULTIPLIER
                         if st["owned"] == 0:
                             st["cost_basis"] = 0.0
 
@@ -334,7 +340,7 @@ class AmadeusTradingEnv(gym.Env):
         else:
             trend = (r1 - 0.5) * 0.2 # STABLE
 
-        return price * (normal + trend) * (volatility/12) * 0.01
+        return price * (normal + trend) * (volatility / self.TICKS_PER_DAY) * 0.01
 
     def _change_economy(self):
         r = self.np_random.random()
@@ -386,12 +392,12 @@ class AmadeusTradingEnv(gym.Env):
     def render(self):
         econ_names = ["STABLE", "BOOM", "BUST"]
         econ_str = econ_names[self.economy] if self.economy < len(econ_names) else "UNKNOWN"
-        hour = (self.ticks % 12) + 1
+        hour = (self.ticks % self.TICKS_PER_DAY) + 1
         pnl = self.net_worth - 1000.00
         pnl_sign = "+" if pnl >= 0 else ""
 
         print("\n" + "=" * 65)
-        print(f" [AMADEUS TERMINAL] Day: {self.days:03d} | Tick: {hour:02d}/12 | Economy: {econ_str:<6} ")
+        print(f" [AMADEUS TERMINAL] Day: {self.days:03d} | Tick: {hour:02d}/{self.TICKS_PER_DAY:02d} | Economy: {econ_str:<6} ")
         print(f" Cash: ${self.cash:>9.2f} | Net Worth: ${self.net_worth:>9.2f} ({pnl_sign}${pnl:.2f})")
         print("-" * 65)
         print(f" {'ASSET':<6} | {'PRICE':>8} | {'OWNED':>6} | {'BASIS':>8} | {'UNREAL P/L':>11}")
@@ -424,7 +430,7 @@ if __name__ == "__main__":
     env = AmadeusTradingEnv()
 
     # Simulating a random agent taking random trades
-    episodes = 1000
+    episodes = 500
     total_rewards = []
 
     for ep in tqdm(range(episodes), desc="Simulating Random Agent Actions"):
