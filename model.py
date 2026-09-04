@@ -1,286 +1,399 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
+from tensordict import TensorDict
+from tensordict.nn import TensorDictModule
+from torchrl.modules.models.model_based_v3 import RSSMPriorV3, RSSMPosteriorV3
+from torchrl.objectives.dreamer_v3 import DreamerV3ModelLoss, DreamerV3ActorLoss, DreamerV3ValueLoss
 
-# --- Utilities ---
-def symlog(x):
-    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+# ==============================================================================
+# 1. DreamerV3 MLP Building Block (RMS-Normalized SiLU MLP with Outscale)
+# ==============================================================================
+class DreamerV3MLP(nn.Module):
+    """
+    DreamerV3 RMS-normalized MLP building block as specified in:
+    https://docs.pytorch.org/rl/main/reference/dreamer_v3.html
+    and Hafner et al., 2023.
+    """
+    DEFAULT_DEPTH = 2
+    DEFAULT_OUTSCALE = 1.0
+    DEFAULT_NORM_EPS = 1e-4
 
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
-
-def twohot(x, bins=255, min_val=-20.0, max_val=20.0):
-    x = torch.clamp(x, min_val, max_val)
-    bin_width = (max_val - min_val) / (bins - 1)
-    bin_indices = (x - min_val) / bin_width
-    lower = torch.floor(bin_indices).long()
-    upper = torch.ceil(bin_indices).long()
-    
-    lower_weight = upper.float() - bin_indices
-    upper_weight = bin_indices - lower.float()
-    
-    same = (lower == upper)
-    lower_weight[same] = 1.0
-    upper_weight[same] = 0.0
-    
-    batch_shape = x.shape
-    two_hot = torch.zeros((*batch_shape, bins), device=x.device)
-    two_hot.scatter_add_(-1, lower.unsqueeze(-1), lower_weight.unsqueeze(-1))
-    two_hot.scatter_add_(-1, upper.unsqueeze(-1), upper_weight.unsqueeze(-1))
-    return two_hot
-
-def twohot_loss(logits, targets, bins=255, min_val=-20.0, max_val=20.0):
-    targets_twohot = twohot(targets, bins, min_val, max_val).detach()
-    loss = -torch.sum(targets_twohot * F.log_softmax(logits, dim=-1), dim=-1)
-    return loss.mean()
-
-def twohot_decode(logits, bins=255, min_val=-20.0, max_val=20.0):
-    probs = F.softmax(logits, dim=-1)
-    bin_width = (max_val - min_val) / (bins - 1)
-    supports = torch.linspace(min_val, max_val, bins, device=logits.device)
-    expected_value = torch.sum(probs * supports, dim=-1, keepdim=True)
-    return expected_value
-
-class CategoricalLatent(nn.Module):
-    def __init__(self, num_categoricals=16, num_classes=16, unimix_ratio=0.01):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int | None = None,
+        depth: int = DEFAULT_DEPTH,
+        num_cells: int = 512,
+        outscale: float = DEFAULT_OUTSCALE,
+        norm_eps: float = DEFAULT_NORM_EPS,
+        device=None,
+    ):
         super().__init__()
-        self.num_categoricals = num_categoricals
-        self.num_classes = num_classes
-        self.unimix_ratio = unimix_ratio
+        out_features = out_features if out_features is not None else num_cells
+        layers = []
+        curr_in = in_features
 
-    def forward(self, logits):
-        logits = logits.view(-1, self.num_categoricals, self.num_classes)
-        probs = F.softmax(logits, dim=-1)
-        
-        if self.unimix_ratio > 0.0:
-            probs = (1.0 - self.unimix_ratio) * probs + self.unimix_ratio / self.num_classes
-        
-        dist = D.OneHotCategorical(probs=probs)
-        sample = dist.sample()
-        
-        st_sample = sample + (probs - probs.detach())
-        flat_latent = st_sample.view(-1, self.num_categoricals * self.num_classes)
-        
-        return flat_latent, logits
+        for _ in range(depth):
+            layers.append(nn.Linear(curr_in, num_cells, device=device))
+            layers.append(nn.RMSNorm(num_cells, eps=norm_eps, device=device))
+            layers.append(nn.SiLU())
+            curr_in = num_cells
 
-# --- Networks ---
-class MLPEncoder(nn.Module):
-    def __init__(self, obs_dim, hidden_dim=256, out_dim=1024):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim * 2, out_dim)
-        )
-        self.out_dim = out_dim
-        
-    def forward(self, x):
-        # x: [B, obs_dim]
+        # Final projection layer scaled by outscale
+        out_layer = nn.Linear(curr_in, out_features, device=device)
+        bound = outscale / (curr_in ** 0.5)
+        nn.init.uniform_(out_layer.weight, -bound, bound)
+        nn.init.zeros_(out_layer.bias)
+        layers.append(out_layer)
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-class MLPDecoder(nn.Module):
-    def __init__(self, in_dim, obs_dim, hidden_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, obs_dim)
-        )
-        
-    def forward(self, x):
-        return self.net(x)
 
-class RSSM(nn.Module):
-    def __init__(self, action_dim=14, hidden_dim=256, enc_dim=1024, num_categoricals=16, num_classes=16):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_categoricals = num_categoricals
-        self.num_classes = num_classes
-        self.latent_dim = num_categoricals * num_classes
-        
-        self.rnn = nn.GRUCell(self.latent_dim + action_dim, hidden_dim)
-        
-        self.prior_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, self.latent_dim)
-        )
-        
-        self.post_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + enc_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, self.latent_dim)
-        )
-        self.latent_sampler = CategoricalLatent(num_categoricals, num_classes)
-        
-    def initial_state(self, batch_size, device):
-        h = torch.zeros(batch_size, self.hidden_dim, device=device)
-        z = torch.zeros(batch_size, self.latent_dim, device=device)
-        return h, z
+# ==============================================================================
+# 2. Complete DreamerV3 World Model
+# ==============================================================================
+class DreamerV3WorldModel(nn.Module):
+    """
+    Full World Model combining:
+    - Observation Encoder
+    - RSSM Dynamics (Prior & Posterior)
+    - Observation Reconstruction Decoder
+    - Reward Predictor (Two-Hot Categorical)
+    - Continuation Predictor
+    """
+    MLP_DEPTH = 2
+    ENCODER_OUTSCALE = 1.0
+    DECODER_OUTSCALE = 1.0
+    REWARD_OUTSCALE = 0.0
+    CONTINUE_OUTSCALE = 1.0
 
-    def step_prior(self, h_prev, z_prev, action):
-        x = torch.cat([z_prev, action], dim=-1)
-        h = self.rnn(x, h_prev)
-        prior_logits = self.prior_mlp(h)
-        z_prior, prior_d_logits = self.latent_sampler(prior_logits)
-        return h, z_prior, prior_d_logits
-
-    def step_posterior(self, h, enc_out):
-        post_logits = self.post_mlp(torch.cat([h, enc_out], dim=-1))
-        z_post, post_d_logits = self.latent_sampler(post_logits)
-        return z_post, post_d_logits
-
-class DensePredictor(nn.Module):
-    def __init__(self, in_dim, hidden_dim=256, out_dim=255, layers=2):
-        super().__init__()
-        net = []
-        for i in range(layers):
-            d_in = in_dim if i == 0 else hidden_dim
-            net.extend([nn.Linear(d_in, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(inplace=True)])
-        net.append(nn.Linear(hidden_dim, out_dim))
-        self.net = nn.Sequential(*net)
-        
-    def forward(self, x):
-        return self.net(x)
-
-class ActorCritic(nn.Module):
-    def __init__(self, feat_dim, action_dim=14, hidden_dim=256, layers=1):
-        super().__init__()
-        actor_net = []
-        for i in range(layers):
-            d_in = feat_dim if i == 0 else hidden_dim
-            actor_net.extend([nn.Linear(d_in, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(inplace=True)])
-        actor_net.append(nn.Linear(hidden_dim, action_dim))
-        self.actor = nn.Sequential(*actor_net)
-        
-        self.critic = DensePredictor(feat_dim, hidden_dim, out_dim=255, layers=layers)
-        
-        self.ema_critic = DensePredictor(feat_dim, hidden_dim, out_dim=255, layers=layers)
-        self.ema_critic.load_state_dict(self.critic.state_dict())
-        for param in self.ema_critic.parameters():
-            param.requires_grad = False
-
-    def update_ema(self, decay=0.98):
-        with torch.no_grad():
-            for param, ema_param in zip(self.critic.parameters(), self.ema_critic.parameters()):
-                ema_param.data.copy_(decay * ema_param.data + (1 - decay) * param.data)
-
-    def select_action(self, feat, explore=True):
-        logits = self.actor(feat)
-        probs = F.softmax(logits, dim=-1)
-        if explore:
-            probs = 0.99 * probs + 0.01 / logits.shape[-1]
-            dist = D.Categorical(probs=probs)
-            action = dist.sample()
-        else:
-            action = torch.argmax(probs, dim=-1)
-        return action
-
-class WorldModel(nn.Module):
-    def __init__(self, obs_dim=64, action_dim=14):
+    def __init__(
+        self,
+        obs_dim: int = 64,
+        action_dim: int = 14,
+        embed_dim: int = 512,
+        hidden_dim: int = 512,
+        num_categoricals: int = 16,
+        num_classes: int = 16,
+        num_reward_bins: int = 255,
+        device=None,
+    ):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.hidden_dim = 256
-        
-        self.encoder = MLPEncoder(obs_dim=self.obs_dim, hidden_dim=self.hidden_dim, out_dim=1024)
-        self.rssm = RSSM(action_dim=action_dim, hidden_dim=self.hidden_dim, enc_dim=self.encoder.out_dim)
-        self.feat_dim = self.hidden_dim + self.rssm.latent_dim
-        
-        self.decoder = MLPDecoder(in_dim=self.feat_dim, obs_dim=self.obs_dim, hidden_dim=self.hidden_dim)
-        self.reward_predictor = DensePredictor(self.feat_dim, self.hidden_dim, out_dim=255, layers=2)
-        self.continue_predictor = DensePredictor(self.feat_dim, self.hidden_dim, out_dim=1, layers=2)
-        
-    def unroll(self, obs, act, cont):
-        B, T = act.shape
-        
-        # Flatten temporal observation vector properly
-        obs_flat = obs.view(B * T, -1)
-        enc_out = self.encoder(obs_flat).view(B, T, -1)
-        
-        act_onehot = F.one_hot(act, num_classes=self.action_dim).float()
-        
-        h, z = self.rssm.initial_state(B, obs.device)
-        
-        post_states = []
-        prior_logits_list = []
-        post_logits_list = []
-        
-        for t in range(T):
-            mask = cont[:, t].unsqueeze(-1)
-            h = h * mask
-            z = z * mask
-            
-            prior_logits = self.rssm.prior_mlp(h)
-            z_prior, prior_d_logits = self.rssm.latent_sampler(prior_logits)
-            
-            z_post, post_logits = self.rssm.step_posterior(h, enc_out[:, t])
-            
-            post_states.append(torch.cat([h, z_post], dim=-1))
-            prior_logits_list.append(prior_logits)
-            post_logits_list.append(post_logits)
-            
-            x = torch.cat([z_post, act_onehot[:, t]], dim=-1)
-            h = self.rssm.rnn(x, h)
-            z = z_post
-            
-        post_states = torch.stack(post_states, dim=1)
-        prior_logits = torch.stack(prior_logits_list, dim=1)
-        post_logits = torch.stack(post_logits_list, dim=1)
-        
-        return post_states, prior_logits, post_logits
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_categoricals = num_categoricals
+        self.num_classes = num_classes
+        self.state_dim = num_categoricals * num_classes
 
-    def kl_loss(self, post_logits, prior_logits, free_bits=1.0, kl_balance=0.8):
-        B, T = post_logits.shape[:2]
-        post_logits = post_logits.view(B*T, self.rssm.num_categoricals, self.rssm.num_classes)
-        prior_logits = prior_logits.view(B*T, self.rssm.num_categoricals, self.rssm.num_classes)
-        
-        post_dist = D.Independent(D.OneHotCategorical(logits=post_logits), 1)
-        prior_dist = D.Independent(D.OneHotCategorical(logits=prior_logits), 1)
-        
-        kl_prior = D.kl.kl_divergence(
-            D.Independent(D.OneHotCategorical(logits=post_logits.detach()), 1), 
-            prior_dist
+        # 1. Observation Encoder
+        self.encoder = DreamerV3MLP(
+            in_features=obs_dim,
+            out_features=embed_dim,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.ENCODER_OUTSCALE,
+            device=device,
         )
-        kl_post = D.kl.kl_divergence(
-            post_dist, 
-            D.Independent(D.OneHotCategorical(logits=prior_logits.detach()), 1)
-        )
-        
-        kl_prior = torch.clamp(kl_prior, min=free_bits)
-        kl_post = torch.clamp(kl_post, min=free_bits)
-        
-        loss = (kl_balance * kl_prior + (1.0 - kl_balance) * kl_post).mean()
-        return loss
 
-    def imagine(self, start_feat, actor, horizon=15):
-        h = start_feat[:, :self.hidden_dim]
-        z = start_feat[:, self.hidden_dim:]
-        
-        imagined_feats = []
-        imagined_actions = []
-        next_feats = []
-        
-        for _ in range(horizon):
-            feat = torch.cat([h, z], dim=-1)
-            imagined_feats.append(feat)
-            
-            action = actor.select_action(feat.detach(), explore=True)
-            imagined_actions.append(action)
-            act_onehot = F.one_hot(action, num_classes=self.action_dim).float()
-            
-            h, z, _ = self.rssm.step_prior(h, z, act_onehot)
-            next_feats.append(torch.cat([h, z], dim=-1))
-            
-        return torch.stack(imagined_feats, dim=0), torch.stack(imagined_actions, dim=0), torch.stack(next_feats, dim=0)
+        # 2. RSSM Prior (Dynamics Transition Model)
+        self.rssm_prior = RSSMPriorV3(
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            rnn_hidden_dim=hidden_dim,
+            num_categoricals=num_categoricals,
+            num_classes=num_classes,
+            device=device,
+        )
+
+        # 3. RSSM Posterior (Representation Model)
+        self.rssm_posterior = RSSMPosteriorV3(
+            hidden_dim=hidden_dim,
+            num_categoricals=num_categoricals,
+            num_classes=num_classes,
+            rnn_hidden_dim=hidden_dim,
+            obs_embed_dim=embed_dim,
+            device=device,
+        )
+
+        # Features fed to decoders: [state_dim + rnn_hidden_dim]
+        feature_dim = self.state_dim + hidden_dim
+
+        # 4. Observation Decoder (Reconstruction)
+        self.decoder = DreamerV3MLP(
+            in_features=feature_dim,
+            out_features=obs_dim,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.DECODER_OUTSCALE,
+            device=device,
+        )
+
+        # 5. Reward Predictor Head (Symlog Two-Hot Logits)
+        self.reward_head = DreamerV3MLP(
+            in_features=feature_dim,
+            out_features=num_reward_bins,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.REWARD_OUTSCALE,
+            device=device,
+        )
+
+        # 6. Continuation / Discount Predictor Head (Optional)
+        self.continue_head = DreamerV3MLP(
+            in_features=feature_dim,
+            out_features=1,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.CONTINUE_OUTSCALE,
+            device=device,
+        )
+
+    def init_state(self, batch_size: int, device=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns initial stochastic state and deterministic belief."""
+        state = torch.zeros(batch_size, self.state_dim, device=device)
+        belief = torch.zeros(batch_size, self.hidden_dim, device=device)
+        return state, belief
+
+    def forward(self, td: TensorDict) -> TensorDict:
+        """
+        Processes a sequence batch [B, T] or single step TensorDict [B].
+        Input keys required in td:
+          - 'observation'
+          - 'action'
+          - 'state'
+          - 'belief'
+          - ('next', 'observation')
+        """
+        obs = td.get(("next", "observation"), td.get("observation"))
+        action = td.get("action")
+        prev_state = td.get("state")
+        prev_belief = td.get("belief")
+
+        # Sequence unroll if input has a time dimension (3D: [B, T, D])
+        if obs.ndim == 3:
+            B, T, _ = obs.shape
+            obs_flat = obs.view(B * T, self.obs_dim)
+            obs_embed = self.encoder(obs_flat).view(B, T, self.embed_dim)
+
+            curr_state = prev_state[:, 0]
+            curr_belief = prev_belief[:, 0]
+
+            prior_logits_list, post_logits_list = [], []
+            state_list, belief_list = [], []
+
+            for t in range(T):
+                act_t = action[:, t]
+                emb_t = obs_embed[:, t]
+
+                p_log, p_st, curr_belief = self.rssm_prior(curr_state, curr_belief, act_t)
+                q_log, curr_state = self.rssm_posterior(curr_belief, emb_t)
+
+                prior_logits_list.append(p_log)
+                post_logits_list.append(q_log)
+                state_list.append(curr_state)
+                belief_list.append(curr_belief)
+
+            prior_logits = torch.stack(prior_logits_list, dim=1)
+            post_logits = torch.stack(post_logits_list, dim=1)
+            next_state = torch.stack(state_list, dim=1)
+            next_belief = torch.stack(belief_list, dim=1)
+
+            features = torch.cat([next_state, next_belief], dim=-1)
+            feat_flat = features.view(B * T, -1)
+
+            reco_obs = self.decoder(feat_flat).view(B, T, self.obs_dim)
+            reward_logits = self.reward_head(feat_flat).view(B, T, -1)
+            continue_logits = self.continue_head(feat_flat).view(B, T, -1)
+
+        else: # Single step (2D: [B, D])
+            obs_embed = self.encoder(obs)
+            prior_logits, prior_state, next_belief = self.rssm_prior(prev_state, prev_belief, action)
+            post_logits, next_state = self.rssm_posterior(next_belief, obs_embed)
+
+            features = torch.cat([next_state, next_belief], dim=-1)
+            reco_obs = self.decoder(features)
+            reward_logits = self.reward_head(features)
+            continue_logits = self.continue_head(features)
+
+        # Write predictions and updated states into TensorDict
+        td.set(("next", "prior_logits"), prior_logits)
+        td.set(("next", "posterior_logits"), post_logits)
+        td.set(("next", "state"), next_state)
+        td.set(("next", "belief"), next_belief)
+        td.set(("next", "reco_observation"), reco_obs)
+        td.set(("next", "reward"), reward_logits)
+        td.set(("next", "continue_pred"), continue_logits)
+
+        return td
+
+
+# ==============================================================================
+# 3. DreamerV3 Actor & Critic Networks
+# ==============================================================================
+class DreamerV3Actor(nn.Module):
+    """
+    Policy Actor: Maps latent features [state + belief] -> Action logits.
+    """
+    MLP_DEPTH = 2
+    ACTOR_OUTSCALE = 0.01  # Small initial logits for high entropy exploration
+
+    def __init__(
+        self,
+        action_dim: int = 14,
+        state_dim: int = 256,
+        belief_dim: int = 512,
+        hidden_dim: int = 512,
+        device=None,
+    ):
+        super().__init__()
+        self.mlp = DreamerV3MLP(
+            in_features=state_dim + belief_dim,
+            out_features=action_dim,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.ACTOR_OUTSCALE,
+            device=device,
+        )
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, belief], dim=-1)
+        logits = self.mlp(x)
+        return logits
+
+
+class DreamerV3Critic(nn.Module):
+    """
+    Value Critic: Maps latent features [state + belief] -> Value prediction (Two-Hot or Symlog).
+    """
+    MLP_DEPTH = 2
+    CRITIC_OUTSCALE = 0.0
+
+    def __init__(
+        self,
+        num_value_bins: int = 255,
+        state_dim: int = 256,
+        belief_dim: int = 512,
+        hidden_dim: int = 512,
+        device=None,
+    ):
+        super().__init__()
+        self.mlp = DreamerV3MLP(
+            in_features=state_dim + belief_dim,
+            out_features=num_value_bins,
+            depth=self.MLP_DEPTH,
+            num_cells=hidden_dim,
+            outscale=self.CRITIC_OUTSCALE,
+            device=device,
+        )
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, belief], dim=-1)
+        return self.mlp(x)
+
+
+# ==============================================================================
+# 4. End-to-End Verification Test
+# ==============================================================================
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Testing DreamerV3 implementation on: {device}")
+
+    OBS_DIM = 64
+    ACTION_DIM = 14
+    NUM_CATEGORICALS = 16
+    NUM_CLASSES = 16
+    HIDDEN_DIM = 512
+    NUM_BINS = 255
+
+    # 1. Instantiate World Model
+    world_model = DreamerV3WorldModel(
+        obs_dim=OBS_DIM,
+        action_dim=ACTION_DIM,
+        embed_dim=HIDDEN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_categoricals=NUM_CATEGORICALS,
+        num_classes=NUM_CLASSES,
+        num_reward_bins=NUM_BINS,
+        device=device,
+    )
+
+    # 2. Instantiate Actor & Critic
+    state_dim = NUM_CATEGORICALS * NUM_CLASSES
+    actor = DreamerV3Actor(
+        action_dim=ACTION_DIM,
+        state_dim=state_dim,
+        belief_dim=HIDDEN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        device=device,
+    )
+    critic = DreamerV3Critic(
+        num_value_bins=NUM_BINS,
+        state_dim=state_dim,
+        belief_dim=HIDDEN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        device=device,
+    )
+
+    # 3. Wrap in TensorDictModules
+    actor_module = TensorDictModule(
+        actor,
+        in_keys=["state", "belief"],
+        out_keys=["action_logits"],
+    )
+    critic_module = TensorDictModule(
+        critic,
+        in_keys=["state", "belief"],
+        out_keys=["state_value"],
+    )
+
+    # 4. Create sample batch (Batch=4, Sequence=10)
+    B, T = 4, 10
+    raw_td = TensorDict({
+        "observation": torch.randn(B, T, OBS_DIM, device=device),
+        "action": torch.randn(B, T, ACTION_DIM, device=device),
+        "state": torch.zeros(B, T, state_dim, device=device),
+        "belief": torch.zeros(B, T, HIDDEN_DIM, device=device),
+        "next": {
+            "observation": torch.randn(B, T, OBS_DIM, device=device),
+            "reward": torch.randn(B, T, 1, device=device),
+            "done": torch.zeros(B, T, 1, dtype=torch.bool, device=device),
+        }
+    }, [B, T], device=device)
+
+    # 5. Forward Pass through World Model directly
+    out_td = world_model(raw_td.clone())
+    print("\n[OK] World Model sequence forward pass successful!")
+    print(f"  Reconstructed obs: {out_td.get(('next', 'reco_observation')).shape}")
+    print(f"  Predicted reward:  {out_td.get(('next', 'reward')).shape}")
+    print(f"  Posterior logits:  {out_td.get(('next', 'posterior_logits')).shape}")
+    print(f"  Prior logits:      {out_td.get(('next', 'prior_logits')).shape}")
+
+    # 6. Compute DreamerV3 Model Loss (LossModule calls world_model internally)
+    wm_loss_fn = DreamerV3ModelLoss(
+        world_model,
+        lambda_kl=1.0,
+        lambda_reco=1.0,
+        lambda_reward=1.0,
+        num_reward_bins=NUM_BINS,
+        free_bits=1.0,
+        global_average=True,  # For vector observation inputs
+    )
+    wm_loss_fn.set_keys(pixels="observation", reco_pixels="reco_observation")
+
+    loss_td, _ = wm_loss_fn(raw_td.clone())
+    print("\n[OK] DreamerV3 Model Loss successfully computed:")
+    for k, v in loss_td.items():
+        print(f"  {k}: {v.item():.4f}")
+
+    # 7. Actor & Critic forward passes
+    actor_td = actor_module(out_td.clone())
+    critic_td = critic_module(out_td.clone())
+    print(f"\n[OK] Actor logits shape:  {actor_td['action_logits'].shape}")
+    print(f"[OK] Critic values shape: {critic_td['state_value'].shape}")
+    print("\nAll DreamerV3 components initialized, tested, and working cleanly!")
